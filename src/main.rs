@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use opencv::core::{self, AlgorithmHint, Mat, Point, Point2f, Scalar, Size, Vector};
+use opencv::core::{
+    self, AlgorithmHint, BORDER_REPLICATE, Mat, Point, Point2f, Scalar, Size, Vector,
+};
 use opencv::imgcodecs;
 use opencv::imgproc::{self, InterpolationFlags};
 use opencv::prelude::*;
@@ -22,10 +24,24 @@ struct Args {
     /// Minimum contour area to consider as a photo (in pixels)
     #[arg(long, default_value_t = 20_000.0)]
     min_area: f64,
+    /// Padding (in pixels) added around the image before detection to catch edge-touching photos
+    #[arg(long, default_value_t = 12)]
+    pad: i32,
+    /// Canny low threshold (raise to be less sensitive, lower to be more sensitive)
+    #[arg(long, default_value_t = 50.0)]
+    canny_low: f64,
+    /// Canny high threshold (must be > low; defaults to 3x low if not set)
+    #[arg(long, default_value_t = 150.0)]
+    canny_high: f64,
 }
 
 struct DetectedPhoto {
     warped: Mat,
+}
+
+struct RectCandidate {
+    rect: core::RotatedRect,
+    area: f64,
 }
 
 fn main() -> Result<()> {
@@ -46,7 +62,14 @@ fn main() -> Result<()> {
         }
 
         println!("Processing {}...", path.display());
-        match process_image(path, &args.output_dir, args.min_area) {
+        match process_image(
+            path,
+            &args.output_dir,
+            args.min_area,
+            args.pad,
+            args.canny_low,
+            args.canny_high,
+        ) {
             Ok(count) => {
                 if count == 0 {
                     println!("  No photos found");
@@ -63,11 +86,18 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn process_image(path: &Path, output_dir: &Path, min_area: f64) -> Result<usize> {
+fn process_image(
+    path: &Path,
+    output_dir: &Path,
+    min_area: f64,
+    pad: i32,
+    canny_low: f64,
+    canny_high: f64,
+) -> Result<usize> {
     let img = imgcodecs::imread(path.to_str().unwrap_or_default(), imgcodecs::IMREAD_COLOR)
         .with_context(|| format!("Could not read image {}", path.display()))?;
 
-    let crops = detect_photos(&img, min_area)
+    let crops = detect_photos(&img, min_area, pad, canny_low, canny_high)
         .with_context(|| format!("Failed to analyze {}", path.display()))?;
 
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
@@ -88,10 +118,29 @@ fn process_image(path: &Path, output_dir: &Path, min_area: f64) -> Result<usize>
     Ok(crops.len())
 }
 
-fn detect_photos(image: &Mat, min_area: f64) -> Result<Vec<DetectedPhoto>> {
+fn detect_photos(
+    image: &Mat,
+    min_area: f64,
+    pad: i32,
+    canny_low: f64,
+    canny_high: f64,
+) -> Result<Vec<DetectedPhoto>> {
+    let pad = pad.max(0);
+    let mut padded = Mat::default();
+    core::copy_make_border(
+        image,
+        &mut padded,
+        pad,
+        pad,
+        pad,
+        pad,
+        BORDER_REPLICATE,
+        Scalar::all(0.0),
+    )?;
+
     let mut gray = Mat::default();
     imgproc::cvt_color(
-        image,
+        &padded,
         &mut gray,
         imgproc::COLOR_BGR2GRAY,
         0,
@@ -124,8 +173,15 @@ fn detect_photos(image: &Mat, min_area: f64) -> Result<Vec<DetectedPhoto>> {
     let mut inverted = Mat::default();
     core::bitwise_not(&binary, &mut inverted, &core::no_array())?;
 
+    let (low, high) = if canny_high <= canny_low {
+        let high = (canny_low * 3.0).max(canny_low + 1.0);
+        (canny_low, high)
+    } else {
+        (canny_low, canny_high)
+    };
+
     let mut edges = Mat::default();
-    imgproc::canny(&inverted, &mut edges, 50.0, 150.0, 3, false)?;
+    imgproc::canny(&inverted, &mut edges, low, high, 3, false)?;
 
     let kernel =
         imgproc::get_structuring_element(imgproc::MORPH_RECT, Size::new(5, 5), Point::new(-1, -1))?;
@@ -150,7 +206,7 @@ fn detect_photos(image: &Mat, min_area: f64) -> Result<Vec<DetectedPhoto>> {
         Point::new(0, 0),
     )?;
 
-    let mut photos = Vec::new();
+    let mut rects = Vec::new();
 
     for contour in contours {
         let area = imgproc::contour_area(&contour, false)?;
@@ -164,7 +220,24 @@ fn detect_photos(image: &Mat, min_area: f64) -> Result<Vec<DetectedPhoto>> {
             continue;
         }
 
-        let warped = warp_photo(image, &rect)?;
+        rects.push(RectCandidate { rect, area });
+    }
+
+    // Keep only the largest rectangle when overlapping occurs (nested or partial overlap).
+    rects.sort_by(|a, b| b.area.partial_cmp(&a.area).unwrap());
+    let mut filtered: Vec<RectCandidate> = Vec::new();
+    'outer: for candidate in rects {
+        for kept in &filtered {
+            if rects_overlap(&kept.rect, &candidate.rect)? {
+                continue 'outer;
+            }
+        }
+        filtered.push(candidate);
+    }
+
+    let mut photos = Vec::new();
+    for r in filtered {
+        let warped = warp_photo(&padded, &r.rect)?;
         photos.push(DetectedPhoto { warped });
     }
 
@@ -240,6 +313,26 @@ fn order_points(points: &[Point2f; 4]) -> [Point2f; 4] {
 
 fn distance(a: &Point2f, b: &Point2f) -> f32 {
     ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt()
+}
+
+fn rects_overlap(a: &core::RotatedRect, b: &core::RotatedRect) -> Result<bool> {
+    let (ax1, ay1, ax2, ay2) = rect_bbox(a)?;
+    let (bx1, by1, bx2, by2) = rect_bbox(b)?;
+
+    let intersect_w = (ax2.min(bx2) - ax1.max(bx1)).max(0.0);
+    let intersect_h = (ay2.min(by2) - ay1.max(by1)).max(0.0);
+
+    Ok(intersect_w > 0.0 && intersect_h > 0.0)
+}
+
+fn rect_bbox(rect: &core::RotatedRect) -> Result<(f32, f32, f32, f32)> {
+    let mut pts = [Point2f::default(); 4];
+    rect.points(&mut pts)?;
+    let min_x = pts.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+    let max_x = pts.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+    let min_y = pts.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+    let max_y = pts.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+    Ok((min_x, min_y, max_x, max_y))
 }
 
 fn is_image_file(path: &Path) -> bool {
